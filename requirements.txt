@@ -1,0 +1,8 @@
+langchain_community
+langchain_core
+langchain_openai
+langgraph
+pydantic
+python-dotenv
+langgraph-checkpoint-sqlite>=1.0.0
+scikit-learn
