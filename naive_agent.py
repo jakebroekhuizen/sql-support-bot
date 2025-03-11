@@ -28,7 +28,6 @@ RESET = "\033[0m"
 # Load the model
 model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
 
-
 # ------------------------------------------------------------------------------
 # Customer Agent
 # ------------------------------------------------------------------------------

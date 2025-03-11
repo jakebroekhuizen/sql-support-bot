@@ -16,6 +16,8 @@ from langgraph.graph import END, START, MessageGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
 
+import prompts
+
 load_dotenv()
 
 # Load the database
@@ -36,21 +38,38 @@ model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
 
 # Customer info tool
 @tool
-def get_customer_info(customer_id: int):
-    """Look up customer info given their ID. ALWAYS make sure you have the customer ID before invoking this."""
-    return db.run(f"SELECT * FROM customers WHERE CustomerID = {customer_id};")
+def get_customer_info(
+    *, customer_id: int = None, user_role: str = None, user_id: int = None
+):
+    """
+    Look up customer info given their ID.
 
+    Args:
+        customer_id (int): The ID of the target customer to view.
+        user_role (str): The role of the user ("employee" or "customer").
+        user_id (int): The authenticated user ID, used for RBAC checks.
+    """
+    # print(
+    #     "get_customer_info called with:",
+    #     customer_id,
+    #     user_role,
+    #     user_id,
+    # )  # Debug
 
-# Set up the prompt
-customer_prompt = """Your job is to help a user update their profile.
+    # Implement RBAC
+    if user_role == "employee":
+        return db.run(f"SELECT * FROM customers WHERE CustomerID = {customer_id};")
+    elif user_role == "customer" and not customer_id:
+        return db.run(f"SELECT * FROM customers WHERE CustomerID = {user_id};")
+    elif user_role == "customer" and customer_id != user_id:
+        return "Access denied: You can only view your own customer information."
 
-You only have certain tools you can use. These tools require specific input. If you don't know the required input, then ask the user for it.
-
-If you are unable to help the user, you can """
+    # Default case or if additional_kwargs is missing
+    return "Unable to verify permissions. Please authenticate first."
 
 
 def get_customer_messages(messages):
-    return [SystemMessage(content=customer_prompt)] + messages
+    return [SystemMessage(content=prompts.customer_prompt)] + messages
 
 
 # Bind the tools to the model
@@ -167,6 +186,42 @@ def _get_last_ai_message(messages):
     return None
 
 
+def get_user_role_and_Id(db, first_name: str, last_name: str) -> dict:
+    """Determine if a user is a customer, employee or neither given their first and last name.
+    Returns a dictionary with 'role' and 'id' if found, None otherwise."""
+    # Check employees
+    employees = db.run(
+        f"""
+        SELECT EmployeeId FROM employees 
+        WHERE FirstName='{first_name}' AND LastName='{last_name}'
+    """
+    )
+    if employees and employees.strip() != "[]":
+        try:
+            # Remove brackets, parentheses and extract the number
+            employee_id = int(employees.strip("[]() ").split(",")[0])
+            return {"role": "employee", "id": employee_id}
+        except (ValueError, IndexError):
+            pass
+
+    # Check customers
+    customers = db.run(
+        f"""
+        SELECT CustomerId FROM customers
+        WHERE FirstName='{first_name}' AND LastName='{last_name}'
+    """
+    )
+    if customers and customers.strip() != "[]":
+        try:
+            # Remove brackets, parentheses and extract the number
+            customer_id = int(customers.strip("[]() ").split(",")[0])
+            return {"role": "customer", "id": customer_id}
+        except (ValueError, IndexError):
+            pass
+
+    return None
+
+
 def _is_tool_call(msg):
     return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
 
@@ -211,15 +266,29 @@ async def call_tool(messages):
         last_message = messages[-1]
         if not last_message.content and "tool_calls" in last_message.additional_kwargs:
             new_data = last_message.model_dump()
+
             # Grab the first tool call from additional_kwargs
             tool_call = last_message.additional_kwargs["tool_calls"][0]["function"]
             # Parse the 'arguments' JSON string into an object (if present)
             parsed_args = json.loads(tool_call.get("arguments", "{}"))
-            # Build the JSON structure expected by ToolNode
-            function_call_data = {"name": tool_call["name"], "arguments": parsed_args}
-            new_data["content"] = json.dumps(function_call_data)
-            last_message = AIMessage(**new_data)
-            messages[-1] = last_message  # update the list with the fixed message
+
+            # Find the most recent human message to get user context
+            human_message = next(
+                (msg for msg in reversed(messages) if isinstance(msg, HumanMessage)),
+                None,
+            )
+
+            for tc in new_data.get("tool_calls", []):
+                if (
+                    tc["name"] == "get_customer_info" and human_message
+                ):  # Update get_customer_info tool with required args
+                    tc["args"].update(
+                        {
+                            "user_role": human_message.additional_kwargs.get("role"),
+                            "user_id": human_message.additional_kwargs.get("id"),
+                        }
+                    )
+            messages[-1] = AIMessage(**new_data)
 
     # Use the asynchronous invocation method (ainvoke) instead of invoke.
     tool_messages = await tool_node.ainvoke(messages)
@@ -267,13 +336,43 @@ history = []
 
 
 async def main():
+
+    print(f"{BLUE}Nellie:{RESET} Hi! I'm Nellie, your intelligent assistant.")
+    print(
+        "To start, let's get you authenticated. Please enter your first and last name below.\n"
+    )
+
+    first_name = input("First name: ")
+    last_name = input("Last name: ")
+    print("")
+
+    user_info = get_user_role_and_Id(db, first_name, last_name)
+    if user_info is None:
+        print(
+            f"{BLUE}Nellie:{RESET} I'm sorry, I couldn't find you in the system. Please check your spelling and try again."
+        )
+        return
+
+    print(f"{BLUE}Nellie:{RESET} Welcome, {first_name}!")
+
     while True:
-        user = input("User (q/Q to quit): ")
+        user = input(f"{first_name} (q/Q to quit): ")
         if user in {"q", "Q"}:
             print(f"{BLUE}Nellie:{RESET} See you next time!")
             break
 
-        history.append(HumanMessage(content=user))
+        # Store users message along with their role for RBAC
+        history.append(
+            HumanMessage(
+                content=user,
+                additional_kwargs={
+                    "role": user_info["role"],
+                    "id": user_info["id"],
+                    "first_name": first_name,
+                    "last_name": last_name,
+                },
+            )
+        )
         last_content = None
 
         async for output in graph.astream(history):

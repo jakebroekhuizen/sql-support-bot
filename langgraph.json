@@ -1,7 +1,7 @@
 {
     "dependencies": ["."],
     "graphs": {
-      "chat": "./naive_agent.py:graph"
+      "chat": "./extended_agent.py:graph"
     },
     "env": ".env"
   }
