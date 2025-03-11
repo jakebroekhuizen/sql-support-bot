@@ -68,12 +68,72 @@ def get_customer_info(
     return "Unable to verify permissions. Please authenticate first."
 
 
-def get_customer_messages(messages):
-    return [SystemMessage(content=prompts.customer_prompt)] + messages
+@tool
+def update_customer_info(
+    *,
+    customer_id: int = None,
+    field: str = None,
+    new_value: str = None,
+    user_role: str = None,
+    user_id: int = None,
+):
+    """
+    Update a customer information field to a new value.
+
+    Args:
+        customer_id (int): The target customer ID to update.
+        field (str): The name of the field to update (e.g., "Address", "Email").
+        new_value (str): The new value to assign to that field.
+        user_role (str): The role of the authenticated user ("employee" or "customer").
+        user_id (int): The authenticated user's ID.
+
+    """
+    print(
+        "update_customer_info called with:",
+        customer_id,
+        field,
+        new_value,
+        user_role,
+        user_id,
+    )  # Debug
+
+    # For employees, allow update on any record.
+    if user_role == "employee":
+        db.run(
+            f"UPDATE customers SET {field} = '{new_value}' WHERE CustomerID = {customer_id};"
+        )
+        return f"Customer {customer_id}'s {field} has been updated to: {new_value}"
+
+    # For customers, only allow updating their own record.
+    elif user_role == "customer" and not customer_id:
+        db.run(
+            f"UPDATE customers SET {field} = '{new_value}' WHERE CustomerID = {user_id};"
+        )
+        return f"Your {field} has been updated to: {new_value}"
+    elif user_role == "customer" and customer_id != user_id:
+        return "Access denied: You can only update your own customer information."
+
+    return "Unable to verify permissions. Please authenticate first."
+
+
+def get_customer_info_messages(messages):
+    return [SystemMessage(content=prompts.customer_info_prompt)] + messages
+
+
+def get_update_customer_messages(messages):
+    return [SystemMessage(content=prompts.customer_update_prompt)] + messages
+
+
+update_customer_chain = get_update_customer_messages | model.bind_tools(
+    [update_customer_info]
+)
 
 
 # Bind the tools to the model
-customer_chain = get_customer_messages | model.bind_tools([get_customer_info])
+customer_info_chain = get_customer_info_messages | model.bind_tools([get_customer_info])
+customer_update_chain = get_update_customer_messages | model.bind_tools(
+    [update_customer_info]
+)
 
 # ------------------------------------------------------------------------------
 # Music Agent
@@ -146,23 +206,13 @@ song_recc_chain = get_song_messages | model.bind_tools(
 class Router(BaseModel):
     """Call this if you are able to route the user to the appropriate representative."""
 
-    choice: str = Field(description="should be one of: music, customer")
-
-
-system_message = """Your job is to help as a customer service representative for a music store.
-
-You should interact politely with customers to try to figure out how you can help. You can help in a few ways:
-
-- Updating user information: if a customer wants to update the information in the user database. Call the router with `customer`
-- Recomending music: if a customer wants to find some music or information about music. Call the router with `music`
-
-If the user is asking or wants to ask about updating or accessing their information, send them to that route.
-If the user is asking or wants to ask about music, send them to that route.
-Otherwise, respond."""
+    choice: str = Field(
+        description="should be one of: music, customer_info, customer_update"
+    )
 
 
 def get_messages(messages):
-    return [SystemMessage(content=system_message)] + messages
+    return [SystemMessage(content=prompts.router_prompt)] + messages
 
 
 chain = get_messages | model.bind_tools([Router])
@@ -245,8 +295,10 @@ def _route(messages):
         return "general"
     if last_m.name == "music":
         return "music"
-    elif last_m.name == "customer":
-        return "customer"
+    elif last_m.name == "customer_info":
+        return "customer_info"
+    elif last_m.name == "customer_update":
+        return "customer_update"
     else:
         return "general"
 
@@ -280,7 +332,8 @@ async def call_tool(messages):
 
             for tc in new_data.get("tool_calls", []):
                 if (
-                    tc["name"] == "get_customer_info" and human_message
+                    tc["name"] in ["get_customer_info", "update_customer_info"]
+                    and human_message
                 ):  # Update get_customer_info tool with required args
                     tc["args"].update(
                         {
@@ -299,12 +352,24 @@ async def call_tool(messages):
 # Build Nodes
 # ------------------------------------------------------------------------------
 
-tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs, get_customer_info]
+tools = [
+    get_albums_by_artist,
+    get_tracks_by_artist,
+    check_for_songs,
+    get_customer_info,
+    update_customer_info,
+]
 tool_node = ToolNode(tools)
 general_node = _filter_out_routes | chain | partial(add_name, name="general")
 music_node = _filter_out_routes | song_recc_chain | partial(add_name, name="music")
-customer_node = _filter_out_routes | customer_chain | partial(add_name, name="customer")
-
+customer_info_node = (
+    _filter_out_routes | customer_info_chain | partial(add_name, name="customer_info")
+)
+customer_update_node = (
+    _filter_out_routes
+    | customer_update_chain
+    | partial(add_name, name="customer_update")
+)
 
 # ------------------------------------------------------------------------------
 # Define the graph
@@ -315,20 +380,23 @@ graph = MessageGraph()
 nodes = {
     "general": "general",
     "music": "music",
-    END: END,
     "tools": "tools",
-    "customer": "customer",
+    "customer_info": "customer_info",
+    "customer_update": "customer_update",
+    END: END,
 }
 # Define a new graph
 workflow = MessageGraph()
 workflow.add_node("general", general_node)
 workflow.add_node("music", music_node)
-workflow.add_node("customer", customer_node)
+workflow.add_node("customer_info", customer_info_node)
+workflow.add_node("customer_update", customer_update_node)
 workflow.add_node("tools", call_tool)
 workflow.add_conditional_edges("general", _route, nodes)
 workflow.add_conditional_edges("tools", _route, nodes)
 workflow.add_conditional_edges("music", _route, nodes)
-workflow.add_conditional_edges("customer", _route, nodes)
+workflow.add_conditional_edges("customer_info", _route, nodes)
+workflow.add_conditional_edges("customer_update", _route, nodes)
 workflow.set_conditional_entry_point(_route, nodes)
 graph = workflow.compile()
 
