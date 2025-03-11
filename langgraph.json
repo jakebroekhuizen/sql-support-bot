@@ -1,7 +1,11 @@
 {
-    "dependencies": ["."],
-    "graphs": {
-      "chat": "./extended_agent.py:graph"
-    },
-    "env": ".env"
-  }
+  "dockerfile_lines": [],
+  "graphs": {
+    "chat": "./extended_agent.py:graph"
+  },
+  "env": ".env",
+  "python_version": "3.11",
+  "dependencies": [
+    "."
+  ]
+}
