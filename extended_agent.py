@@ -76,7 +76,7 @@ def get_customer_info(
 @tool
 def update_customer_info(
     *,
-    customer_id: int = None,
+    customer_id: Optional[int] = None,
     field: str = None,
     new_value: str = None,
     user_role: str = None,
@@ -212,7 +212,7 @@ song_recc_chain = get_song_messages | model.bind_tools(
 
 @tool
 def list_invoices_for_customer(
-    *, customer_id: int = None, user_role: str = None, user_id: int = None
+    *, customer_id: Optional[int] = None, user_role: str = None, user_id: int = None
 ):
     """
     List all invoices for the given customer.
@@ -513,6 +513,13 @@ def _get_last_ai_message(messages):
     return None
 
 
+def get_latest_human_with_role(messages):
+    for m in reversed(messages):
+        if isinstance(m, HumanMessage) and m.additional_kwargs.get("role") is not None:
+            return m
+    return None
+
+
 def get_user_role_and_Id(db, first_name: str, last_name: str) -> dict:
     """Determine if a user is a customer, employee or neither given their first and last name.
     Returns a dictionary with 'role' and 'id' if found, None otherwise."""
@@ -607,14 +614,7 @@ async def call_tool(messages):
                 new_data = last_message.model_dump()
 
                 # Find the most recent human message to get user context
-                human_message = next(
-                    (
-                        msg
-                        for msg in reversed(messages)
-                        if isinstance(msg, HumanMessage)
-                    ),
-                    None,
-                )
+                human_message = get_latest_human_with_role(messages)
 
                 for tc in new_data.get("tool_calls", []):
                     if (
