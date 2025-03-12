@@ -6,4 +6,3 @@ pydantic
 python-dotenv
 langgraph-checkpoint-sqlite>=1.0.0
 scikit-learn
-ast

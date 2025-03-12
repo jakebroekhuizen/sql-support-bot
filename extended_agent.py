@@ -51,12 +51,6 @@ def get_customer_info(
         user_role (str): The role of the user ("employee" or "customer").
         user_id (int): The authenticated user ID, used for RBAC checks.
     """
-    # print(
-    #     "get_customer_info called with:",
-    #     customer_id,
-    #     user_role,
-    #     user_id,
-    # )  # Debug
 
     # Implement RBAC
     if user_role == "employee":
@@ -90,15 +84,6 @@ def update_customer_info(
         user_id (int): The authenticated user's ID.
 
     """
-    print(
-        "update_customer_info called with:",
-        customer_id,
-        field,
-        new_value,
-        user_role,
-        user_id,
-    )  # Debug
-
     # For employees, allow update on any record.
     if user_role == "employee":
         db.run(
@@ -184,16 +169,8 @@ def check_for_songs(song_title):
     return song_retriever.invoke(song_title)
 
 
-song_system_message = """Your job is to help a customer find any songs they are looking for. 
-
-You only have certain tools you can use. If a customer asks you to look something up that you don't know how, politely tell them what you can help with.
-
-When looking up artists and songs, sometimes the artist/song will not be found. In that case, the tools will return information \
-on simliar songs and artists. This is intentional, it is not the tool messing up."""
-
-
 def get_song_messages(messages):
-    return [SystemMessage(content=song_system_message)] + messages
+    return [SystemMessage(content=prompts.song_prompt)] + messages
 
 
 song_recc_chain = get_song_messages | model.bind_tools(
@@ -201,7 +178,7 @@ song_recc_chain = get_song_messages | model.bind_tools(
 )
 
 # ------------------------------------------------------------------------------
-# Billing Agent
+# Invoice Agent
 # ------------------------------------------------------------------------------
 
 
@@ -264,6 +241,37 @@ def get_invoice_details(*, invoice_id: int, user_role: str = None, user_id: int 
         return "Access denied: this invoice does not belong to you."
 
 
+def get_invoice_messages(messages):
+    # Find the human message to get the role
+    if messages:
+        human_message = next(
+            (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
+        )
+        if human_message:
+            user_role = human_message.additional_kwargs.get("role")
+            if user_role == "employee":
+                return [
+                    SystemMessage(content=prompts.invoice_employee_prompt)
+                ] + messages
+            elif user_role == "customer":
+                return [
+                    SystemMessage(content=prompts.invoice_customer_prompt)
+                ] + messages
+
+    # Default case if no human message or role found
+    return [SystemMessage(content=prompts.invoice_customer_prompt)] + messages
+
+
+invoice_chain = get_invoice_messages | model.bind_tools(
+    [list_invoices_for_customer, get_invoice_details]
+)
+
+
+# ------------------------------------------------------------------------------
+# Refund Agent
+# ------------------------------------------------------------------------------
+
+
 @tool
 def issue_full_refund(*, invoice_id: int, user_role: str = None, user_id: int = None):
     """
@@ -272,12 +280,6 @@ def issue_full_refund(*, invoice_id: int, user_role: str = None, user_id: int = 
     Only employees can do this. The refund is processed by setting the invoice total to 0.
     A negative line item is inserted to record the refund.
     """
-    print(
-        "DEBUG: issue_full_refund called with:",
-        invoice_id,
-        user_role,
-        user_id,
-    )
     if user_role != "employee":
         return "Access denied: Only employees can issue refunds."
 
@@ -327,13 +329,6 @@ def refund_line_item(
     the line item's total price (UnitPrice * Quantity) from the invoice total.
     A negative invoice item is inserted to record the refund transaction.
     """
-    print(
-        "DEBUG: refund_line_item called with:",
-        invoice_id,
-        track_name,
-        user_role,
-        user_id,
-    )
     if user_role != "employee":
         return "Access denied: Only employees can issue partial refunds."
 
@@ -344,7 +339,6 @@ def refund_line_item(
 
     try:
         current_total = ast.literal_eval(invoice_info)[0][0]
-        print(f"DEBUG: Current total: {current_total}")
     except Exception as e:
         return f"Error parsing invoice total: {invoice_info}. Exception: {e}"
 
@@ -406,7 +400,7 @@ def refund_line_item(
     )
 
 
-def get_billing_messages(messages):
+def get_refund_messages(messages):
     # Find the human message to get the role
     if messages:
         human_message = next(
@@ -414,32 +408,25 @@ def get_billing_messages(messages):
         )
         if human_message:
             user_role = human_message.additional_kwargs.get("role")
-            print(f"DEBUG: billing chain - user role: {user_role}")
-
-            # Create a custom system message that explicitly states the user's role
-            role_specific_prompt = (
-                f"CURRENT USER IS AN {user_role.upper()}. " + prompts.billing_prompt
-            )
-            print(
-                f"DEBUG: First 200 chars of role-specific prompt: {role_specific_prompt[:200]}"
-            )
-            return [SystemMessage(content=role_specific_prompt)] + messages
+            if user_role == "employee":
+                return [
+                    SystemMessage(content=prompts.refund_employee_prompt)
+                ] + messages
+            elif user_role == "customer":
+                return [
+                    SystemMessage(content=prompts.refund_customer_prompt)
+                ] + messages
 
     # Default case if no human message or role found
-    return [SystemMessage(content=prompts.billing_prompt)] + messages
+    return [SystemMessage(content=prompts.refund_customer_prompt)] + messages
 
 
-billing_chain = get_billing_messages | model.bind_tools(
-    [
-        list_invoices_for_customer,
-        get_invoice_details,
-        issue_full_refund,
-        refund_line_item,
-    ]
+refund_chain = get_refund_messages | model.bind_tools(
+    [issue_full_refund, refund_line_item]
 )
 
 # ------------------------------------------------------------------------------
-# Generic Agent
+# Router Agent
 # ------------------------------------------------------------------------------
 
 
@@ -447,7 +434,7 @@ class Router(BaseModel):
     """Call this if you are able to route the user to the appropriate representative."""
 
     choice: str = Field(
-        description="should be one of: music, customer_info, customer_update, billing"
+        description="should be one of: music, customer_info, customer_update, invoice, refund"
     )
 
 
@@ -518,10 +505,8 @@ def _is_tool_call(msg):
 
 def _route(messages):
     last_message = messages[-1]
-    print(f"DEBUG: _route - last message type: {type(last_message)}")
     if isinstance(last_message, AIMessage):
         if not _is_tool_call(last_message):
-            print("DEBUG: _route - not a tool call, returning END")
             return END
         else:
             if last_message.name == "general":
@@ -530,15 +515,10 @@ def _route(messages):
                     raise ValueError
                 tool_call = tool_calls[0]
                 choice = json.loads(tool_call["function"]["arguments"])["choice"]
-                print(f"DEBUG: _route - routing to: {choice}")
                 return choice
             else:
-                print(
-                    f"DEBUG: _route - returning 'tools' for name: {last_message.name}"
-                )
                 return "tools"
     last_m = _get_last_ai_message(messages)
-    print(f"DEBUG: _route - last AI message name: {getattr(last_m, 'name', None)}")
     if last_m is None:
         return "general"
     if last_m.name == "music":
@@ -547,8 +527,10 @@ def _route(messages):
         return "customer_info"
     elif last_m.name == "customer_update":
         return "customer_update"
-    elif last_m.name == "billing":
-        return "billing"
+    elif last_m.name == "invoice":
+        return "invoice"
+    elif last_m.name == "refund":
+        return "refund"
     else:
         return "general"
 
@@ -587,15 +569,12 @@ async def call_tool(messages):
                         "refund_line_item",
                     ]
                     and human_message
-                ):  # Update get_customer_info tool with required args
+                ):  # Update tool with required args
                     tc["args"].update(
                         {
                             "user_role": human_message.additional_kwargs.get("role"),
                             "user_id": human_message.additional_kwargs.get("id"),
                         }
-                    )
-                    print(
-                        f"DEBUG: Updated tool call args for {tc['name']}: {tc['args']}"
                     )
             messages[-1] = AIMessage(**new_data)
 
@@ -630,7 +609,8 @@ customer_update_node = (
     | customer_update_chain
     | partial(add_name, name="customer_update")
 )
-billing_node = _filter_out_routes | billing_chain | partial(add_name, name="billing")
+invoice_node = _filter_out_routes | invoice_chain | partial(add_name, name="invoice")
+refund_node = _filter_out_routes | refund_chain | partial(add_name, name="refund")
 
 # ------------------------------------------------------------------------------
 # Define the graph
@@ -644,7 +624,8 @@ nodes = {
     "tools": "tools",
     "customer_info": "customer_info",
     "customer_update": "customer_update",
-    "billing": "billing",
+    "invoice": "invoice",
+    "refund": "refund",
     END: END,
 }
 # Define a new graph
@@ -653,14 +634,16 @@ workflow.add_node("general", general_node)
 workflow.add_node("music", music_node)
 workflow.add_node("customer_info", customer_info_node)
 workflow.add_node("customer_update", customer_update_node)
-workflow.add_node("billing", billing_node)
+workflow.add_node("invoice", invoice_node)
+workflow.add_node("refund", refund_node)
 workflow.add_node("tools", call_tool)
 workflow.add_conditional_edges("general", _route, nodes)
 workflow.add_conditional_edges("tools", _route, nodes)
 workflow.add_conditional_edges("music", _route, nodes)
 workflow.add_conditional_edges("customer_info", _route, nodes)
 workflow.add_conditional_edges("customer_update", _route, nodes)
-workflow.add_conditional_edges("billing", _route, nodes)
+workflow.add_conditional_edges("invoice", _route, nodes)
+workflow.add_conditional_edges("refund", _route, nodes)
 workflow.set_conditional_entry_point(_route, nodes)
 graph = workflow.compile()
 
