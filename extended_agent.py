@@ -1,8 +1,10 @@
 import asyncio
 import json
+import sys
+import time
 import warnings
 from functools import partial
-from typing import Optional
+from typing import Literal, Optional
 
 warnings.filterwarnings("ignore", category=Warning)
 
@@ -14,9 +16,10 @@ from langchain_community.vectorstores import SKLearnVectorStore
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langgraph.checkpoint.sqlite import SqliteSaver
-from langgraph.graph import END, START, MessageGraph
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph import END, START, FunctionNode, MessageGraph
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Command, RunContext, interrupt
 from pydantic import BaseModel, Field
 
 import prompts
@@ -32,6 +35,10 @@ RESET = "\033[0m"
 
 # Load the model
 model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
+
+
+def debug_print(msg):
+    print(f"DEBUG: {msg}", file=sys.stderr)
 
 
 # ------------------------------------------------------------------------------
@@ -448,32 +455,89 @@ def refund_line_item(
 
 
 def get_refund_messages(messages):
+    debug_print("get_refund_messages called")
     # Find the human message to get the role
     try:
         if messages:
             human_message = next(
                 (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
             )
+            debug_print(f"Found human message: {human_message is not None}")
             if human_message:
                 user_role = human_message.additional_kwargs.get("role")
+                debug_print(f"User role: {user_role}")
                 if user_role == "employee":
+                    debug_print("Using employee prompt")
                     return [
                         SystemMessage(content=prompts.refund_employee_prompt)
                     ] + messages
                 elif user_role == "customer":
+                    debug_print("Using customer prompt")
                     return [
                         SystemMessage(content=prompts.refund_customer_prompt)
                     ] + messages
 
         # Default case if no human message or role found
+        debug_print("Using default customer prompt")
         return [SystemMessage(content=prompts.refund_customer_prompt)] + messages
     except Exception as e:
+        debug_print(f"Error in get_refund_messages: {str(e)}")
         return f"Unexpected error in get_refund_messages: {e}"
 
 
 refund_chain = get_refund_messages | model.bind_tools(
     [issue_full_refund, refund_line_item]
 )
+
+
+# Modify the refund_chain to include human approval
+def refund_with_approval(messages):
+    """
+    Process refund requests with human-in-the-loop approval.
+    """
+    try:
+        # First, run the normal refund chain to generate the tool call
+        result = refund_chain.invoke(messages)
+
+        # Check if the result contains a refund tool call
+        if isinstance(result, AIMessage) and "tool_calls" in result.additional_kwargs:
+            tool_calls = result.additional_kwargs["tool_calls"]
+            for tc in tool_calls:
+                if tc["function"]["name"] in ["issue_full_refund", "refund_line_item"]:
+                    # Extract refund details
+                    refund_details = tc["function"]["arguments"]
+
+                    # Request human approval
+                    approval_response = interrupt(
+                        {
+                            "question": "A refund request has been initiated. Do you approve processing the refund?",
+                            "refund_details": refund_details,
+                            "options": ["Approve", "Deny"],
+                        }
+                    )
+
+                    # Process based on approval
+                    if (
+                        approval_response
+                        and approval_response.get("choice") == "Approve"
+                    ):
+                        # Continue with the original tool call
+                        return result
+                    else:
+                        # Replace with a denial message
+                        return AIMessage(
+                            content="The refund request has been reviewed but was not approved by management. Please contact the customer to discuss alternative solutions.",
+                            name="refund",
+                        )
+
+        # If no refund tool call was found, just return the original result
+        return result
+    except Exception as e:
+        return AIMessage(
+            content=f"There was an error processing the refund request: {str(e)}. Please try again later.",
+            name="refund",
+        )
+
 
 # ------------------------------------------------------------------------------
 # Router Agent
@@ -514,10 +578,26 @@ def _get_last_ai_message(messages):
 
 
 def get_latest_human_with_role(messages):
+    """
+    Scans the message list to find the last human message with a role.
+    """
     for m in reversed(messages):
         if isinstance(m, HumanMessage) and m.additional_kwargs.get("role") is not None:
             return m
     return None
+
+
+def extract_refund_details(messages):
+    """
+    Scans the message list to find the last refund tool call and extracts its arguments.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            tool_calls = msg.additional_kwargs.get("tool_calls", [])
+            for tc in tool_calls:
+                if tc["function"]["name"] in ["issue_full_refund", "refund_line_item"]:
+                    return tc["function"]["arguments"]
+    return {}
 
 
 def get_user_role_and_Id(db, first_name: str, last_name: str) -> dict:
@@ -563,24 +643,70 @@ def _is_tool_call(msg):
     return hasattr(msg, "additional_kwargs") and "tool_calls" in msg.additional_kwargs
 
 
+def _is_refund_tool_call(message):
+    """Check if the message contains a refund tool call."""
+    debug_print(f"Checking if message is refund tool call")
+    if not _is_tool_call(message):
+        debug_print("Not a tool call")
+        return False
+
+    tool_calls = message.additional_kwargs.get("tool_calls", [])
+    debug_print(f"Found {len(tool_calls)} tool calls")
+
+    for tc in tool_calls:
+        debug_print(f"Tool call: {tc}")
+        if "function" in tc and tc["function"]["name"] in [
+            "issue_full_refund",
+            "refund_line_item",
+        ]:
+            debug_print("Found refund tool call!")
+            return True
+    debug_print("No refund tool calls found")
+    return False
+
+
 def _route(messages):
+    debug_print(f"_route called with {len(messages)} messages")
     last_message = messages[-1]
+    debug_print(f"Last message type: {type(last_message)}")
+
     if isinstance(last_message, AIMessage):
+        debug_print(
+            f"Last message is AIMessage with name: {getattr(last_message, 'name', 'None')}"
+        )
+        debug_print(
+            f"Last message has tool_calls: {'tool_calls' in last_message.additional_kwargs}"
+        )
+
         if not _is_tool_call(last_message):
+            debug_print("Not a tool call, returning END")
             return END
         else:
+            debug_print("Is a tool call")
             if last_message.name == "general":
                 tool_calls = last_message.additional_kwargs["tool_calls"]
+                debug_print(f"General message with {len(tool_calls)} tool calls")
                 if len(tool_calls) > 1:
                     raise ValueError
                 tool_call = tool_calls[0]
                 choice = json.loads(tool_call["function"]["arguments"])["choice"]
+                debug_print(f"Routing to choice: {choice}")
                 return choice
+            # Check if this is a refund tool call
+            elif _is_refund_tool_call(last_message):
+                debug_print("Detected refund tool call, routing to refund_approval")
+                return "refund_approval"  # Route to approval first
             else:
+                debug_print("Other tool call, routing to tools")
                 return "tools"
+
+    debug_print("Checking last AI message")
     last_m = _get_last_ai_message(messages)
     if last_m is None:
+        debug_print("No last AI message, routing to general")
         return "general"
+
+    debug_print(f"Last AI message name: {getattr(last_m, 'name', 'None')}")
     if last_m.name == "music":
         return "music"
     elif last_m.name == "customer":
@@ -590,6 +716,7 @@ def _route(messages):
     elif last_m.name == "refund":
         return "refund"
     else:
+        debug_print("Default routing to general")
         return "general"
 
 
@@ -639,7 +766,7 @@ async def call_tool(messages):
                         )
                 messages[-1] = AIMessage(**new_data)
 
-        # Use the asynchronous invocation method (ainvoke) instead of invoke.
+        # asychronously invoke
         tool_messages = await tool_node.ainvoke(messages)
         return tool_messages
     except Exception as e:
@@ -649,6 +776,30 @@ async def call_tool(messages):
 # ------------------------------------------------------------------------------
 # Build Nodes
 # ------------------------------------------------------------------------------
+
+
+@functional_node(include_context=True)
+def refund_approval_node(
+    messages, context: RunContext
+) -> Command[Literal["refund", "general"]]:
+    # 1) Extract details from the conversation
+    refund_details = extract_refund_details(messages)
+
+    # 2) Use interrupt(..., context=context)
+    approval = interrupt(
+        {
+            "question": f"A refund request has been initiated with details: {refund_details}. Do you approve?",
+            "options": ["Approve", "Deny"],
+        },
+        context=context,
+    )
+
+    # 3) Resume
+    if approval and approval.get("choice") == "Approve":
+        return Command(goto="refund")
+    else:
+        return Command(goto="general")
+
 
 tools = [
     get_albums_by_artist,
@@ -666,13 +817,14 @@ general_node = _filter_out_routes | chain | partial(add_name, name="general")
 music_node = _filter_out_routes | song_recc_chain | partial(add_name, name="music")
 customer_node = _filter_out_routes | customer_chain | partial(add_name, name="customer")
 invoice_node = _filter_out_routes | invoice_chain | partial(add_name, name="invoice")
-refund_node = _filter_out_routes | refund_chain | partial(add_name, name="refund")
+refund_regular_node = (
+    _filter_out_routes | refund_chain | partial(add_name, name="refund")
+)
 
 # ------------------------------------------------------------------------------
 # Define the graph
 # ------------------------------------------------------------------------------
 
-memory = SqliteSaver.from_conn_string(":memory:")
 graph = MessageGraph()
 nodes = {
     "general": "general",
@@ -681,6 +833,7 @@ nodes = {
     "customer": "customer",
     "invoice": "invoice",
     "refund": "refund",
+    "refund_approval": "refund_approval",
     END: END,
 }
 # Define a new graph
@@ -689,7 +842,8 @@ workflow.add_node("general", general_node)
 workflow.add_node("music", music_node)
 workflow.add_node("customer", customer_node)
 workflow.add_node("invoice", invoice_node)
-workflow.add_node("refund", refund_node)
+workflow.add_node("refund", refund_regular_node)
+workflow.add_node("refund_approval", refund_approval_node)
 workflow.add_node("tools", call_tool)
 workflow.add_conditional_edges("general", _route, nodes)
 workflow.add_conditional_edges("tools", _route, nodes)
@@ -697,66 +851,74 @@ workflow.add_conditional_edges("music", _route, nodes)
 workflow.add_conditional_edges("customer", _route, nodes)
 workflow.add_conditional_edges("invoice", _route, nodes)
 workflow.add_conditional_edges("refund", _route, nodes)
+workflow.add_conditional_edges("refund_approval", _route, nodes)
 workflow.set_conditional_entry_point(_route, nodes)
-graph = workflow.compile()
 
 history = []
 
 
 async def main():
+    async with AsyncSqliteSaver.from_conn_string(":memory:") as memory:
+        graph = workflow.compile(checkpointer=memory)
 
-    print(f"{BLUE}Nellie:{RESET} Hi! I'm Nellie, your intelligent assistant.")
-    print(
-        "To start, let's get you authenticated. Please enter your first and last name below.\n"
-    )
-
-    first_name = input("First name: ")
-    last_name = input("Last name: ")
-    print("")
-
-    user_info = get_user_role_and_Id(db, first_name, last_name)
-    if user_info is None:
+        print(f"{BLUE}Nellie:{RESET} Hi! I'm Nellie, your intelligent assistant.")
         print(
-            f"{BLUE}Nellie:{RESET} I'm sorry, I couldn't find you in the system. Please check your spelling and try again."
+            "To start, let's get you authenticated. Please enter your first and last name below.\n"
         )
-        return
 
-    print(f"{BLUE}Nellie:{RESET} Welcome, {first_name}!")
+        first_name = input("First name: ")
+        last_name = input("Last name: ")
+        print("")
 
-    while True:
-        user = input(f"{first_name} (q/Q to quit): ")
-        if user in {"q", "Q"}:
-            print(f"{BLUE}Nellie:{RESET} See you next time!")
-            break
-
-        # Store users message along with their role for RBAC
-        history.append(
-            HumanMessage(
-                content=user,
-                additional_kwargs={
-                    "role": user_info["role"],
-                    "id": user_info["id"],
-                    "first_name": first_name,
-                    "last_name": last_name,
-                },
+        user_info = get_user_role_and_Id(db, first_name, last_name)
+        if user_info is None:
+            print(
+                f"{BLUE}Nellie:{RESET} I'm sorry, I couldn't find you in the system. Please check your spelling and try again."
             )
-        )
-        last_content = None
+            return
 
-        async for output in graph.astream(history):
-            if END in output or START in output:
-                continue
-            # Only store the content, don't print intermediate outputs
-            for key, value in output.items():
-                if isinstance(value, AIMessage):
-                    last_content = value.content
+        print(f"{BLUE}Nellie:{RESET} Welcome, {first_name}!")
 
-        # Print the final output with the "Nellie" label in color
-        if last_content:
-            print(f"{BLUE}Nellie:{RESET} {last_content}")
-            history.append(AIMessage(content=last_content))
-        else:
-            print(f"{BLUE}Nellie:{RESET} I'm sorry, I couldn't process that request.")
+        # Generate a unique thread ID for this conversation
+        thread_id = f"thread_{first_name}_{last_name}_{int(time.time())}"
+        thread_config = {"configurable": {"thread_id": thread_id}}
+
+        while True:
+            user = input(f"{first_name} (q/Q to quit): ")
+            if user in {"q", "Q"}:
+                print(f"{BLUE}Nellie:{RESET} See you next time!")
+                break
+
+            # Store user's message along with their role for RBAC
+            history.append(
+                HumanMessage(
+                    content=user,
+                    additional_kwargs={
+                        "role": user_info["role"],
+                        "id": user_info["id"],
+                        "first_name": first_name,
+                        "last_name": last_name,
+                    },
+                )
+            )
+            last_content = None
+
+            async for output in graph.astream(history, thread_config):
+                if END in output or START in output:
+                    continue
+                # Only store the content, don't print intermediate outputs
+                for key, value in output.items():
+                    if isinstance(value, AIMessage):
+                        last_content = value.content
+
+            # Print the final output with the "Nellie" label in color
+            if last_content:
+                print(f"{BLUE}Nellie:{RESET} {last_content}")
+                history.append(AIMessage(content=last_content))
+            else:
+                print(
+                    f"{BLUE}Nellie:{RESET} I'm sorry, I couldn't process that request."
+                )
 
 
 if __name__ == "__main__":
