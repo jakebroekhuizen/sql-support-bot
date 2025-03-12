@@ -103,23 +103,30 @@ def update_customer_info(
     return "Unable to verify permissions. Please authenticate first."
 
 
-def get_customer_info_messages(messages):
-    return [SystemMessage(content=prompts.customer_info_prompt)] + messages
+def get_customer_messages(messages):
+    # Find the human message to get the role
+    if messages:
+        human_message = next(
+            (m for m in reversed(messages) if isinstance(m, HumanMessage)), None
+        )
+        if human_message:
+            user_role = human_message.additional_kwargs.get("role")
+            if user_role == "employee":
+                return [
+                    SystemMessage(content=prompts.customer_employee_prompt)
+                ] + messages
+            elif user_role == "customer":
+                return [
+                    SystemMessage(content=prompts.customer_customer_prompt)
+                ] + messages
+
+    # Default case if no human message or role found
+    return [SystemMessage(content=prompts.customer_customer_prompt)] + messages
 
 
-def get_update_customer_messages(messages):
-    return [SystemMessage(content=prompts.customer_update_prompt)] + messages
-
-
-update_customer_chain = get_update_customer_messages | model.bind_tools(
-    [update_customer_info]
-)
-
-
-# Bind the tools to the model
-customer_info_chain = get_customer_info_messages | model.bind_tools([get_customer_info])
-customer_update_chain = get_update_customer_messages | model.bind_tools(
-    [update_customer_info]
+# Bind both tools
+customer_chain = get_customer_messages | model.bind_tools(
+    [get_customer_info, update_customer_info]
 )
 
 # ------------------------------------------------------------------------------
@@ -434,7 +441,7 @@ class Router(BaseModel):
     """Call this if you are able to route the user to the appropriate representative."""
 
     choice: str = Field(
-        description="should be one of: music, customer_info, customer_update, invoice, refund"
+        description="should be one of: music, customer, invoice, refund"
     )
 
 
@@ -523,10 +530,8 @@ def _route(messages):
         return "general"
     if last_m.name == "music":
         return "music"
-    elif last_m.name == "customer_info":
-        return "customer_info"
-    elif last_m.name == "customer_update":
-        return "customer_update"
+    elif last_m.name == "customer":
+        return "customer"
     elif last_m.name == "invoice":
         return "invoice"
     elif last_m.name == "refund":
@@ -601,14 +606,7 @@ tools = [
 tool_node = ToolNode(tools)
 general_node = _filter_out_routes | chain | partial(add_name, name="general")
 music_node = _filter_out_routes | song_recc_chain | partial(add_name, name="music")
-customer_info_node = (
-    _filter_out_routes | customer_info_chain | partial(add_name, name="customer_info")
-)
-customer_update_node = (
-    _filter_out_routes
-    | customer_update_chain
-    | partial(add_name, name="customer_update")
-)
+customer_node = _filter_out_routes | customer_chain | partial(add_name, name="customer")
 invoice_node = _filter_out_routes | invoice_chain | partial(add_name, name="invoice")
 refund_node = _filter_out_routes | refund_chain | partial(add_name, name="refund")
 
@@ -622,8 +620,7 @@ nodes = {
     "general": "general",
     "music": "music",
     "tools": "tools",
-    "customer_info": "customer_info",
-    "customer_update": "customer_update",
+    "customer": "customer",
     "invoice": "invoice",
     "refund": "refund",
     END: END,
@@ -632,16 +629,14 @@ nodes = {
 workflow = MessageGraph()
 workflow.add_node("general", general_node)
 workflow.add_node("music", music_node)
-workflow.add_node("customer_info", customer_info_node)
-workflow.add_node("customer_update", customer_update_node)
+workflow.add_node("customer", customer_node)
 workflow.add_node("invoice", invoice_node)
 workflow.add_node("refund", refund_node)
 workflow.add_node("tools", call_tool)
 workflow.add_conditional_edges("general", _route, nodes)
 workflow.add_conditional_edges("tools", _route, nodes)
 workflow.add_conditional_edges("music", _route, nodes)
-workflow.add_conditional_edges("customer_info", _route, nodes)
-workflow.add_conditional_edges("customer_update", _route, nodes)
+workflow.add_conditional_edges("customer", _route, nodes)
 workflow.add_conditional_edges("invoice", _route, nodes)
 workflow.add_conditional_edges("refund", _route, nodes)
 workflow.set_conditional_entry_point(_route, nodes)
