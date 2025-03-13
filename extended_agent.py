@@ -481,11 +481,20 @@ refund_chain = get_refund_messages | model.bind_tools(
 
 
 class Router(BaseModel):
-    """Call this if you are able to route the user to the appropriate representative."""
+    """Transfers the user to the appropriate assistant based on their request."""
 
     choice: str = Field(
-        description="should be one of: music, customer, invoice, refund"
+        description="should be one of: music, customer, or billing depending on the user's request"
     )
+
+    class Config:
+        json_schema_extra = {
+            "examples": [
+                {"choice": "music"},
+                {"choice": "customer"},
+                {"choice": "billing"},
+            ]
+        }
 
 
 def get_messages(messages):
