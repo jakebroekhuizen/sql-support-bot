@@ -12,7 +12,7 @@ import ast
 from dotenv import load_dotenv
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_community.vectorstores import SKLearnVectorStore
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.memory import MemorySaver
@@ -34,6 +34,17 @@ RESET = "\033[0m"
 
 # Load the model
 model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
+
+
+# ------------------------------------------------------------------------------
+# Generic Tool
+# ------------------------------------------------------------------------------
+
+
+@tool
+def reroute(route: str):
+    """Reroute the user to the appropriate assistant based on their request."""
+    return "REROUTE TO " + route
 
 
 # ------------------------------------------------------------------------------
@@ -143,7 +154,7 @@ def get_customer_messages(messages):
 
 # Bind both tools
 customer_chain = get_customer_messages | model.bind_tools(
-    [get_customer_info, update_customer_info]
+    [get_customer_info, update_customer_info, reroute]
 )
 
 # ------------------------------------------------------------------------------
@@ -204,7 +215,7 @@ def get_song_messages(messages):
 
 
 song_recc_chain = get_song_messages | model.bind_tools(
-    [get_albums_by_artist, get_tracks_by_artist, check_for_songs]
+    [get_albums_by_artist, get_tracks_by_artist, check_for_songs, reroute]
 )
 
 # ------------------------------------------------------------------------------
@@ -302,7 +313,7 @@ def get_invoice_messages(messages):
 
 
 invoice_chain = get_invoice_messages | model.bind_tools(
-    [list_invoices_for_customer, get_invoice_details]
+    [list_invoices_for_customer, get_invoice_details, reroute]
 )
 
 
@@ -474,7 +485,7 @@ def get_refund_messages(messages):
 
 
 refund_chain = get_refund_messages | model.bind_tools(
-    [issue_full_refund, refund_line_item]
+    [issue_full_refund, refund_line_item, reroute]
 )
 
 # ------------------------------------------------------------------------------
@@ -521,6 +532,15 @@ def _get_last_ai_message(messages):
     for m in messages[::-1]:
         if isinstance(m, AIMessage):
             return m
+    return None
+
+
+def _get_last_tool_content(messages):
+    for m in messages[::-1]:
+        if isinstance(m, ToolMessage):
+            if not _is_tool_call(m):
+                return m.content
+            return m.content
     return None
 
 
@@ -591,6 +611,19 @@ def _route(messages):
                 return choice
             else:
                 return "tools"
+
+    # Check if the last tool message is a reroute response
+    last_tool_content = _get_last_tool_content(messages)
+    if (
+        last_tool_content
+        and isinstance(last_tool_content, str)
+        and last_tool_content.startswith("REROUTE TO ")
+    ):
+        # Extract the destination from the reroute response
+        destination = last_tool_content.replace("REROUTE TO ", "").strip()
+        if destination in ["music", "customer", "invoice", "refund"]:
+            return destination
+
     last_m = _get_last_ai_message(messages)
     if last_m is None:
         return "general"
@@ -671,6 +704,7 @@ tools = [
     get_invoice_details,
     issue_full_refund,
     refund_line_item,
+    reroute,
 ]
 tool_node = ToolNode(tools)
 general_node = _filter_out_routes | chain | partial(add_name, name="general")
