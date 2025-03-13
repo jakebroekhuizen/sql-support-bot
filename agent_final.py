@@ -1,6 +1,7 @@
 import ast
-from typing import Annotated, Callable, Optional
+from typing import Annotated, Callable, Literal, Optional
 
+from dotenv import load_dotenv
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_community.vectorstores import SKLearnVectorStore
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -11,18 +12,14 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import AnyMessage, add_messages
-from langgraph.prebuilt import tools_condition
+from langgraph.prebuilt import ToolNode, tools_condition
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
+load_dotenv()
+
 model = ChatOpenAI(model="gpt-4o-turbo-preview", temperature=0)
 db = SQLDatabase.from_uri("sqlite:///chinook.db")
-
-
-class State(TypedDict):
-    messages: Annotated[list[AnyMessage], add_messages]
-    first_name: str
-    last_name: str
 
 
 # ------------------------------------------------------------------------------
@@ -440,6 +437,20 @@ class CompleteOrEscalate(BaseModel):
 
 
 # ------------------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------------------
+
+
+def update_dialog_stack(left: list[str], right: Optional[str]) -> list[str]:
+    """Push or pop the state."""
+    if right is None:
+        return left
+    if right == "pop":
+        return left[:-1]
+    return left + [right]
+
+
+# ------------------------------------------------------------------------------
 # Define Top-level Assistant
 # ------------------------------------------------------------------------------
 
@@ -570,14 +581,31 @@ music_prompt = ChatPromptTemplate.from_messages(
         ("placeholder", "{messages}"),
     ]
 )
-music_safe_tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs]
+music_tools = [get_albums_by_artist, get_tracks_by_artist, check_for_songs]
 music_assistant_runnable = music_prompt | model.bind_tools(
-    music_safe_tools + [CompleteOrEscalate]
+    music_tools + [CompleteOrEscalate]
 )
 
 # ------------------------------------------------------------------------------
 # Define Graph
 # ------------------------------------------------------------------------------
+
+
+class State(TypedDict):
+    messages: Annotated[list[AnyMessage], add_messages]
+    first_name: str
+    last_name: str
+    dialog_state: Annotated[
+        list[
+            Literal[
+                "primary_assistant",
+                "music_assistant",
+                "customer_assistant",
+                "billing_assistant",
+            ]
+        ],
+        update_dialog_stack,
+    ]
 
 
 workflow = StateGraph(State)
@@ -589,22 +617,154 @@ def user_info(state: State):
 
 # NEW: The fetch_user_info node runs first, meaning our assistant can see the user's flight information without
 # having to take an action
-builder.add_node("get_customer_role_and_id", user_info)
-builder.add_edge(START, "get_customer_role_and_id")
-builder.add_node("assistant", Assistant(part_2_assistant_runnable))
-builder.add_node("tools", create_tool_node_with_fallback(part_2_tools))
-builder.add_edge("fetch_user_info", "assistant")
-builder.add_conditional_edges(
-    "assistant",
-    tools_condition,
+workflow.add_node("get_customer_role_and_id", user_info)
+workflow.add_edge(START, "get_customer_role_and_id")
+
+# Billing Assistant
+workflow.add_node("billing_assistant", Assistant(billing_assistant_runnable))
+workflow.add_edge("primary_assistant", "billing_assistant")
+workflow.add_node("billing_safe_tools", ToolNode(billing_safe_tools))
+workflow.add_node("billing_risky_tools", ToolNode(billing_risky_tools))
+
+
+def route_billing(state: State):
+    route = tools_condition(state)
+    if route == END:
+        return END
+    tool_calls = state["messages"][-1].tool_calls
+    did_cancel = any(tc["name"] == CompleteOrEscalate.__name__ for tc in tool_calls)
+    if did_cancel:
+        return "leave_skill"
+    safe_toolnames = [t.name for t in billing_safe_tools]
+    if all(tc["name"] in safe_toolnames for tc in tool_calls):
+        return "billing_safe_tools"
+    return "billing_risky_tools"
+
+
+workflow.add_edge("billing_safe_tools", "billing_assistant")
+workflow.add_edge("billing_risky_tools", "billing_assistant")
+workflow.add_conditional_edges(
+    "billing_assistant",
+    route_billing,
+    ["billing_safe_tools", "billing_risky_tools", "leave_skill", END],
 )
-builder.add_edge("tools", "assistant")
+
+
+def pop_dialog_state(state: State) -> dict:
+    """Pop the dialog stack and return to the primary assistant.
+
+    This lets the full graph explicitly track the dialog flow and delegate control
+    to specific sub-agents.
+    """
+    messages = []
+    if state["messages"][-1].tool_calls:
+        # Note: Doesn't currently handle the edge case where the llm performs parallel tool calls
+        messages.append(
+            ToolMessage(
+                content="Resuming dialog with the host assistant. Please reflect on the past conversation and assist the user as needed.",
+                tool_call_id=state["messages"][-1].tool_calls[0]["id"],
+            )
+        )
+    return {
+        "dialog_state": "pop",
+        "messages": messages,
+    }
+
+
+workflow.add_node("leave_skill", pop_dialog_state)
+workflow.add_edge("leave_skill", "primary_assistant")
+
+workflow.add_node("customer_assistant", Assistant(customer_assistant_runnable))
+workflow.add_edge("primary_assistant", "customer_assistant")
+workflow.add_node("customer_safe_tools", ToolNode(customer_safe_tools))
+workflow.add_node("customer_risky_tools", ToolNode(customer_risky_tools))
+
+
+def route_customer(state: State):
+    route = tools_condition(state)
+    if route == END:
+        return END
+    tool_calls = state["messages"][-1].tool_calls
+    did_cancel = any(tc["name"] == CompleteOrEscalate.__name__ for tc in tool_calls)
+    if did_cancel:
+        return "leave_skill"
+    safe_toolnames = [t.name for t in customer_safe_tools]
+    if all(tc["name"] in safe_toolnames for tc in tool_calls):
+        return "customer_safe_tools"
+    return "customer_risky_tools"
+
+
+workflow.add_edge("customer_safe_tools", "customer_assistant")
+workflow.add_edge("customer_risky_tools", "customer_assistant")
+workflow.add_conditional_edges(
+    "customer_assistant",
+    route_customer,
+    ["customer_safe_tools", "customer_risky_tools", "leave_skill", END],
+)
+
+
+# Music Assistant
+workflow.add_node("music_assistant", Assistant(music_assistant_runnable))
+workflow.add_node("music_tools", ToolNode(music_tools))
+
+
+def route_music(state: State):
+    route = tools_condition(state)
+    if route == END:
+        return END
+    tool_calls = state["messages"][-1].tool_calls
+    did_cancel = any(tc["name"] == CompleteOrEscalate.__name__ for tc in tool_calls)
+    if did_cancel:
+        return "leave_skill"
+    return "music_tools"
+
+
+workflow.add_edge("music_tools", "music_assistant")
+workflow.add_conditional_edges(
+    "music_assistant",
+    route_music,
+    ["music_tools", "leave_skill", END],
+)
+
+# Primary Assistant
+
+
+def route_primary_assistant(state: State):
+    route = tools_condition(state)
+    if route == END:
+        return END
+    tool_calls = state["messages"][-1].tool_calls
+    if tool_calls:
+        if tool_calls[0]["name"] == Router.__name__:
+            routing_choice = tool_calls[0]["args"].get("routing_choice")
+            if routing_choice == "music":
+                return "music_assistant"
+            elif routing_choice == "customer":
+                return "customer_assistant"
+            elif routing_choice == "billing":
+                return "billing_assistant"
+        return "primary_assistant_tools"
+    raise ValueError("Invalid route")
+
+
+workflow.add_node("primary_assistant", Assistant(primary_assistant_runnable))
+workflow.add_node("primary_assistant_tools", ToolNode([Router]))
+workflow.add_edge("get_customer_role_and_id", "primary_assistant")
+workflow.add_edge("primary_assistant_tools", "primary_assistant")
+workflow.add_conditional_edges(
+    "primary_assistant",
+    route_primary_assistant,
+    [
+        "music_assistant",
+        "customer_assistant",
+        "billing_assistant",
+        "primary_assistant_tools",
+        END,
+    ],
+)
 
 memory = MemorySaver()
-part_2_graph = builder.compile(
+workflow = workflow.compile(
     checkpointer=memory,
-    # NEW: The graph will always halt before executing the "tools" node.
-    # The user can approve or reject (or even alter the request) before
-    # the assistant continues
-    interrupt_before=["tools"],
+    interrupt_before=["customer_risky_tools", "billing_risky_tools"],
 )
