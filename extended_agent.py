@@ -35,6 +35,23 @@ model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
 
 
 # ------------------------------------------------------------------------------
+# Generic Tools
+# ------------------------------------------------------------------------------
+
+
+@tool
+def complete_or_reroute(*, cancel: bool = True, reason: str):
+    """
+    Signal that the current agent needs to complete its task or reroute to another agent.
+
+    Args:
+        cancel: Whether to cancel the current conversation flow (True) or continue (False)
+        reason: The reason for completing or rerouting
+    """
+    return f"Rerouting: {reason}"
+
+
+# ------------------------------------------------------------------------------
 # Customer Agent
 # ------------------------------------------------------------------------------
 
@@ -141,7 +158,7 @@ def get_customer_messages(messages):
 
 # Bind both tools
 customer_chain = get_customer_messages | model.bind_tools(
-    [get_customer_info, update_customer_info]
+    [get_customer_info, update_customer_info, complete_or_reroute]
 )
 
 # ------------------------------------------------------------------------------
@@ -202,7 +219,7 @@ def get_song_messages(messages):
 
 
 song_recc_chain = get_song_messages | model.bind_tools(
-    [get_albums_by_artist, get_tracks_by_artist, check_for_songs]
+    [get_albums_by_artist, get_tracks_by_artist, check_for_songs, complete_or_reroute]
 )
 
 # ------------------------------------------------------------------------------
@@ -300,7 +317,7 @@ def get_invoice_messages(messages):
 
 
 invoice_chain = get_invoice_messages | model.bind_tools(
-    [list_invoices_for_customer, get_invoice_details]
+    [list_invoices_for_customer, get_invoice_details, complete_or_reroute]
 )
 
 
@@ -472,7 +489,7 @@ def get_refund_messages(messages):
 
 
 refund_chain = get_refund_messages | model.bind_tools(
-    [issue_full_refund, refund_line_item]
+    [issue_full_refund, refund_line_item, complete_or_reroute]
 )
 
 # ------------------------------------------------------------------------------
@@ -578,15 +595,18 @@ def _route(messages):
         if not _is_tool_call(last_message):
             return END
         else:
+            tool_calls = last_message.additional_kwargs["tool_calls"]
+            tool_call = tool_calls[0]
             if last_message.name == "general":
-                tool_calls = last_message.additional_kwargs["tool_calls"]
                 if len(tool_calls) > 1:
                     raise ValueError
-                tool_call = tool_calls[0]
                 choice = json.loads(tool_call["function"]["arguments"])["choice"]
                 return choice
+            elif tool_call["function"]["name"] == "complete_or_reroute":
+                return "general"
             else:
                 return "tools"
+
     last_m = _get_last_ai_message(messages)
     if last_m is None:
         return "general"
@@ -682,14 +702,13 @@ refund_node = _filter_out_routes | refund_chain | partial(add_name, name="refund
 # ------------------------------------------------------------------------------
 
 memory = SqliteSaver.from_conn_string(":memory:")
-graph = MessageGraph()
 nodes = {
-    "general": "general",
     "music": "music",
-    "tools": "tools",
     "customer": "customer",
     "invoice": "invoice",
     "refund": "refund",
+    "tools": "tools",
+    "general": "general",
     END: END,
 }
 # Define a new graph
@@ -700,19 +719,23 @@ workflow.add_node("customer", customer_node)
 workflow.add_node("invoice", invoice_node)
 workflow.add_node("refund", refund_node)
 workflow.add_node("tools", call_tool)
+
+
 workflow.add_conditional_edges("general", _route, nodes)
 workflow.add_conditional_edges("tools", _route, nodes)
 workflow.add_conditional_edges("music", _route, nodes)
 workflow.add_conditional_edges("customer", _route, nodes)
 workflow.add_conditional_edges("invoice", _route, nodes)
 workflow.add_conditional_edges("refund", _route, nodes)
+
+
+workflow.add_edge(START, "general")
 workflow.set_conditional_entry_point(_route, nodes)
 graph = workflow.compile()
 
-history = []
-
 
 async def main():
+    history = []
 
     print(f"{BLUE}Nellie:{RESET} Hi! I'm Nellie, your intelligent assistant.")
     print(
