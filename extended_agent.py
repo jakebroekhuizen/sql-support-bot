@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 import warnings
 from functools import partial
 from typing import Optional
@@ -14,6 +15,7 @@ from langchain_community.vectorstores import SKLearnVectorStore
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, MessageGraph
 from langgraph.prebuilt import ToolNode
@@ -523,6 +525,7 @@ def _get_last_ai_message(messages):
 
 
 def get_latest_human_with_role(messages):
+    """Get the latest human message with a role."""
     for m in reversed(messages):
         if isinstance(m, HumanMessage) and m.additional_kwargs.get("role") is not None:
             return m
@@ -573,6 +576,7 @@ def _is_tool_call(msg):
 
 
 def _route(messages):
+    """Route the user to the appropriate assistant based on their request."""
     last_message = messages[-1]
     if isinstance(last_message, AIMessage):
         if not _is_tool_call(last_message):
@@ -603,6 +607,7 @@ def _route(messages):
 
 
 def _filter_out_routes(messages):
+    """Remove general tool calls from the messages."""
     ms = []
     for m in messages:
         if _is_tool_call(m):
@@ -624,28 +629,25 @@ async def call_tool(messages):
 
                 # Find the most recent human message to get user context
                 human_message = get_latest_human_with_role(messages)
-
-                for tc in new_data.get("tool_calls", []):
-                    if (
-                        tc["name"]
-                        in [
-                            "get_customer_info",
-                            "update_customer_info",
-                            "list_invoices_for_customer",
-                            "get_invoice_details",
-                            "issue_full_refund",
-                            "refund_line_item",
-                        ]
-                        and human_message
-                    ):  # Update tool with required args
-                        tc["args"].update(
-                            {
-                                "user_role": human_message.additional_kwargs.get(
-                                    "role"
-                                ),
-                                "user_id": human_message.additional_kwargs.get("id"),
-                            }
-                        )
+                tc = new_data.get("tool_calls", [])[0]  # Only one tool call at a time
+                if (
+                    tc["name"]
+                    in [
+                        "get_customer_info",
+                        "update_customer_info",
+                        "list_invoices_for_customer",
+                        "get_invoice_details",
+                        "issue_full_refund",
+                        "refund_line_item",
+                    ]
+                    and human_message
+                ):  # Update tool with required args
+                    tc["args"].update(
+                        {
+                            "user_role": human_message.additional_kwargs.get("role"),
+                            "user_id": human_message.additional_kwargs.get("id"),
+                        }
+                    )
                 messages[-1] = AIMessage(**new_data)
 
         # Use the asynchronous invocation method (ainvoke) instead of invoke.
@@ -681,7 +683,7 @@ refund_node = _filter_out_routes | refund_chain | partial(add_name, name="refund
 # Define the graph
 # ------------------------------------------------------------------------------
 
-memory = SqliteSaver.from_conn_string(":memory:")
+memory = MemorySaver()
 graph = MessageGraph()
 nodes = {
     "general": "general",
@@ -707,6 +709,7 @@ workflow.add_conditional_edges("customer", _route, nodes)
 workflow.add_conditional_edges("invoice", _route, nodes)
 workflow.add_conditional_edges("refund", _route, nodes)
 workflow.set_conditional_entry_point(_route, nodes)
+
 graph = workflow.compile()
 
 history = []
