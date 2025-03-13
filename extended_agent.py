@@ -1,6 +1,5 @@
 import asyncio
 import json
-import uuid
 import warnings
 from functools import partial
 from typing import Optional
@@ -15,8 +14,6 @@ from langchain_community.vectorstores import SKLearnVectorStore
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, MessageGraph
 from langgraph.prebuilt import ToolNode
 from pydantic import BaseModel, Field
@@ -37,7 +34,7 @@ model = ChatOpenAI(temperature=0, streaming=True, model="gpt-4-turbo-preview")
 
 
 # ------------------------------------------------------------------------------
-# Generic Tool
+# Generic RerouteTool
 # ------------------------------------------------------------------------------
 
 
@@ -426,7 +423,7 @@ def refund_line_item(
         # For simplicity, assume there's only one matching line item
         line_item_id, unit_price, quantity, track_id = line_items[0]
 
-        # Calculate the refund amount = UnitPrice * Quantity
+        # Calc refund amount
         refund_amount = unit_price * quantity
         new_total = current_total - refund_amount
         if new_total < 0:
@@ -505,7 +502,8 @@ class Router(BaseModel):
             "examples": [
                 {"choice": "music"},
                 {"choice": "customer"},
-                {"choice": "billing"},
+                {"choice": "invoice"},
+                {"choice": "refund"},
             ]
         }
 
@@ -565,7 +563,7 @@ def get_user_role_and_Id(db, first_name: str, last_name: str) -> dict:
         )
         if employees and employees.strip() != "[]":
             try:
-                # Remove brackets, parentheses and extract the number
+                # Parse ID
                 employee_id = int(employees.strip("[]() ").split(",")[0])
                 return {"role": "employee", "id": employee_id}
             except (ValueError, IndexError):
@@ -580,7 +578,7 @@ def get_user_role_and_Id(db, first_name: str, last_name: str) -> dict:
         )
         if customers and customers.strip() != "[]":
             try:
-                # Remove brackets, parentheses and extract the number
+                # Parse ID
                 customer_id = int(customers.strip("[]() ").split(",")[0])
                 return {"role": "customer", "id": customer_id}
             except (ValueError, IndexError):
@@ -674,7 +672,7 @@ async def call_tool(messages):
                         "refund_line_item",
                     ]
                     and human_message
-                ):  # Update tool with required args
+                ):  # Augment tool with user role and ID
                     tc["args"].update(
                         {
                             "user_role": human_message.additional_kwargs.get("role"),
@@ -683,7 +681,6 @@ async def call_tool(messages):
                     )
                 messages[-1] = AIMessage(**new_data)
 
-        # Use the asynchronous invocation method (ainvoke) instead of invoke.
         tool_messages = await tool_node.ainvoke(messages)
         return tool_messages
     except Exception as e:
@@ -717,8 +714,6 @@ refund_node = _filter_out_routes | refund_chain | partial(add_name, name="refund
 # Define the graph
 # ------------------------------------------------------------------------------
 
-memory = MemorySaver()
-graph = MessageGraph()
 nodes = {
     "general": "general",
     "music": "music",
@@ -742,15 +737,15 @@ workflow.add_conditional_edges("music", _route, nodes)
 workflow.add_conditional_edges("customer", _route, nodes)
 workflow.add_conditional_edges("invoice", _route, nodes)
 workflow.add_conditional_edges("refund", _route, nodes)
-workflow.set_conditional_entry_point(_route, nodes)
+# workflow.set_conditional_entry_point(_route, nodes)
+workflow.add_edge(START, "general")
 
 graph = workflow.compile()
-
-history = []
 
 
 async def main():
 
+    history = []
     print(f"{BLUE}Nellie:{RESET} Hi! I'm Nellie, your intelligent assistant.")
     print(
         "To start, let's get you authenticated. Please enter your first and last name below.\n"
@@ -792,12 +787,12 @@ async def main():
         async for output in graph.astream(history):
             if END in output or START in output:
                 continue
-            # Only store the content, don't print intermediate outputs
+            # don't print intermediate outputs
             for key, value in output.items():
                 if isinstance(value, AIMessage):
                     last_content = value.content
 
-        # Print the final output with the "Nellie" label in color
+        # Show output
         if last_content:
             print(f"{BLUE}Nellie:{RESET} {last_content}")
             history.append(AIMessage(content=last_content))
