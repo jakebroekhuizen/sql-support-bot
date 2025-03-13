@@ -11,7 +11,7 @@ import ast
 from dotenv import load_dotenv
 from langchain_community.utilities.sql_database import SQLDatabase
 from langchain_community.vectorstores import SKLearnVectorStore
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -48,7 +48,7 @@ def complete_or_reroute(*, cancel: bool = True, reason: str):
         cancel: Whether to cancel the current conversation flow (True) or continue (False)
         reason: The reason for completing or rerouting
     """
-    return f"Rerouting: {reason}"
+    return f"REROUTING_SIGNAL: {reason}"
 
 
 # ------------------------------------------------------------------------------
@@ -509,7 +509,8 @@ class Router(BaseModel):
             "examples": [
                 {"choice": "music"},
                 {"choice": "customer"},
-                {"choice": "billing"},
+                {"choice": "invoice"},
+                {"choice": "refund"},
             ]
         }
 
@@ -591,21 +592,26 @@ def _is_tool_call(msg):
 
 def _route(messages):
     last_message = messages[-1]
+
+    if (
+        isinstance(last_message, ToolMessage)
+        and "REROUTING_SIGNAL" in last_message.content
+    ):
+        return "general"
+
     if isinstance(last_message, AIMessage):
         if not _is_tool_call(last_message):
             return END
         else:
             tool_calls = last_message.additional_kwargs["tool_calls"]
+            print("tool_calls", tool_calls)
             tool_call = tool_calls[0]
             if last_message.name == "general":
                 if len(tool_calls) > 1:
                     raise ValueError
                 choice = json.loads(tool_call["function"]["arguments"])["choice"]
                 return choice
-            elif tool_call["function"]["name"] == "complete_or_reroute":
-                return "general"
-            else:
-                return "tools"
+            return "tools"
 
     last_m = _get_last_ai_message(messages)
     if last_m is None:
@@ -689,6 +695,8 @@ tools = [
     get_invoice_details,
     issue_full_refund,
     refund_line_item,
+    complete_or_reroute,
+    Router,
 ]
 tool_node = ToolNode(tools)
 general_node = _filter_out_routes | chain | partial(add_name, name="general")
